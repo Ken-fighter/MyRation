@@ -1,345 +1,452 @@
-import { Ingredient, RationResult, flavorPairings, durableIngredients, defaultIngredientParams } from './types';
+import {
+  Ingredient,
+  MealIngredient,
+  ShoppingItem,
+  IngredientCategory,
+  defaultIngredientParams,
+  ingredientPairings,
+  durableIngredients,
+  ingredientAliases,
+} from './types';
 
-/**
- * 弹性乱炖配给算法 (Flexible Stew Algorithm)
- * 
- * 选品优先级逻辑：
- * 1. 强制位 (Critical): Status = Opened 或 Credits <= 1 的食材必须入选
- * 2. 核心位 (Base): 必须包含 1 种肉类 + 1 种叶菜
- * 3. 填充位 (Filler): 根据 CP 库补足剩余名额
- * 4. 弹性控制: 如果用户选 5 品类，从耐放食材中增补 1 样
- * 
- * 克数计算公式：
- * 单品建议量 = 该品类当前库存 * (1 - 损耗系数) / 该品类剩余顿数
- * 注：若计算出的肉类 > 200g，强制截断为 150g
- */
-export function calculateRation(
-  ingredients: Ingredient[],
-  targetItemCount: 4 | 5
-): RationResult[] {
-  const results: RationResult[] = [];
-  const selectedIds = new Set<string>();
-
-  // 过滤有库存的食材
-  const availableIngredients = ingredients.filter(i => i.quantity > 0 && i.remainingCredits > 0);
-
-  if (availableIngredients.length === 0) {
-    return [];
+// ============ 别名识别函数 ============
+// 用户输入"番茄"，自动识别为"西红柿"
+export function normalizeIngredientName(input: string): string {
+  const trimmed = input.trim();
+  // 先查别名库
+  if (ingredientAliases[trimmed]) {
+    return ingredientAliases[trimmed];
   }
+  // 没找到就返回原名
+  return trimmed;
+}
 
-  // 1. 强制位 (Critical) - 已切开或即将过期的食材
-  const criticalItems = availableIngredients.filter(
-    i => i.isOpened || i.remainingCredits <= 1
-  );
+// ============ 获取食材入库天数 ============
+export function getDaysSinceCreated(ingredient: Ingredient): number {
+  const now = Date.now();
+  const diffMs = now - ingredient.createdAt;
+  return Math.floor(diffMs / (1000 * 60 * 60 * 24));
+}
 
-  criticalItems.forEach(item => {
-    if (results.length < targetItemCount && !selectedIds.has(item.id)) {
-      const amount = calculateAmount(item);
-      results.push({
-        ingredient: item,
-        suggestedAmount: amount,
-        reason: item.isOpened ? '已切开，需优先使用' : '剩余顿数不足，需尽快消耗',
-        priority: 'critical'
-      });
-      selectedIds.add(item.id);
-    }
-  });
+// ============ 库存盘点警告 ============
+export interface StockWarning {
+  ingredient: Ingredient;
+  type: 'expiring' | 'old' | 'opened';
+  message: string;
+  daysOld?: number;
+}
 
-  // 2. 核心位 (Base) - 确保有肉类和叶菜
-  const hasMeat = results.some(r => r.ingredient.category === 'meat');
-  const hasLeafy = results.some(r => r.ingredient.category === 'leafy');
-
-  if (!hasMeat) {
-    const meat = availableIngredients.find(
-      i => i.category === 'meat' && !selectedIds.has(i.id)
-    );
-    if (meat && results.length < targetItemCount) {
-      const amount = calculateAmount(meat);
-      results.push({
-        ingredient: meat,
-        suggestedAmount: amount,
-        reason: '肉类核心食材',
-        priority: 'base'
-      });
-      selectedIds.add(meat.id);
-    }
-  }
-
-  if (!hasLeafy) {
-    // 优先选择剩余顿数少的叶菜
-    const leafyOptions = availableIngredients
-      .filter(i => i.category === 'leafy' && !selectedIds.has(i.id))
-      .sort((a, b) => a.remainingCredits - b.remainingCredits);
+export function getStockWarnings(ingredients: Ingredient[]): StockWarning[] {
+  const warnings: StockWarning[] = [];
+  
+  for (const ing of ingredients) {
+    const daysOld = getDaysSinceCreated(ing);
+    const params = defaultIngredientParams[ing.name];
+    const shelfLife = params?.shelfLife || 7;
     
-    if (leafyOptions.length > 0 && results.length < targetItemCount) {
-      const leafy = leafyOptions[0];
-      const amount = calculateAmount(leafy);
-      results.push({
-        ingredient: leafy,
-        suggestedAmount: amount,
-        reason: leafy.remainingCredits <= 2 ? '不耐放，需优先消耗' : '叶菜核心食材',
-        priority: 'base'
+    // 已切开的食材
+    if (ing.status === 'opened') {
+      warnings.push({
+        ingredient: ing,
+        type: 'opened',
+        message: `${ing.name} 已切开，请尽快食用！`,
       });
-      selectedIds.add(leafy.id);
+    }
+    // 剩余顿数<=1
+    else if (ing.remainingCredits <= 1) {
+      warnings.push({
+        ingredient: ing,
+        type: 'expiring',
+        message: `${ing.name} 只剩 ${ing.remainingCredits} 顿的量，即将吃完！`,
+      });
+    }
+    // 存放时间超过保质期的70%
+    else if (daysOld >= shelfLife * 0.7) {
+      warnings.push({
+        ingredient: ing,
+        type: 'old',
+        daysOld,
+        message: `${ing.name} 已存放 ${daysOld} 天，请优先食用！`,
+      });
     }
   }
+  
+  // 按紧急程度排序：opened > expiring > old
+  const priority = { opened: 0, expiring: 1, old: 2 };
+  warnings.sort((a, b) => priority[a.type] - priority[b.type]);
+  
+  return warnings;
+}
 
-  // 3. 填充位 (Filler) - 根据 CP 库补足
-  const selectedMeat = results.find(r => r.ingredient.category === 'meat');
-  if (selectedMeat) {
-    const pairings = flavorPairings[selectedMeat.ingredient.name] || [];
-    for (const pairingName of pairings) {
-      if (results.length >= targetItemCount - (targetItemCount === 5 ? 1 : 0)) break;
-      
-      const pairedItem = availableIngredients.find(
-        i => i.name === pairingName && !selectedIds.has(i.id)
-      );
-      if (pairedItem) {
-        const amount = calculateAmount(pairedItem);
-        results.push({
-          ingredient: pairedItem,
-          suggestedAmount: amount,
-          reason: `与${selectedMeat.ingredient.name}是黄金搭配`,
-          priority: 'filler'
-        });
-        selectedIds.add(pairedItem.id);
-      }
-    }
-  }
+// ============ 智能补货计算 ============
+export interface RestockResult {
+  item: ShoppingItem;
+  existingStock: number;
+  existingUnit: string;
+  needToBuy: number;
+  totalNeeded: number;
+}
 
-  // 补足剩余位置（非主食）
-  const remaining = availableIngredients
-    .filter(i => !selectedIds.has(i.id) && i.category !== 'staple')
-    .sort((a, b) => a.remainingCredits - b.remainingCredits);
-
-  for (const item of remaining) {
-    if (results.length >= targetItemCount - (targetItemCount === 5 ? 1 : 0)) break;
+export function calculateRestockList(
+  wantedItems: string[], // 用户想买的食材
+  existingIngredients: Ingredient[], // 现有库存
+  existingCredits: number, // 现有剩余顿数
+  additionalCredits: number, // 追加顿数
+  perMealConfig: Record<string, number> = {} // 每顿消耗量配置
+): RestockResult[] {
+  const totalCredits = existingCredits + additionalCredits;
+  const results: RestockResult[] = [];
+  
+  // 默认每顿消耗量
+  const defaultPerMeal: Record<IngredientCategory, number> = {
+    meat: 130,
+    leafy: 150,
+    mushroom: 80,
+    root: 120,
+    staple: 80,
+    other: 100,
+  };
+  
+  for (const itemName of wantedItems) {
+    const normalizedName = normalizeIngredientName(itemName);
+    const params = defaultIngredientParams[normalizedName];
+    const category = params?.category || 'other';
+    const unit = params?.unit || 'g';
+    const unitWeight = params?.unitWeight || 100;
     
-    const amount = calculateAmount(item);
-    results.push({
-      ingredient: item,
-      suggestedAmount: amount,
-      reason: '填充食材',
-      priority: 'filler'
-    });
-    selectedIds.add(item.id);
-  }
-
-  // 4. 弹性控制 - 5品类时从耐放食材增补
-  if (targetItemCount === 5 && results.length < 5) {
-    const durableItem = availableIngredients.find(
-      i => durableIngredients.includes(i.name) && !selectedIds.has(i.id)
-    );
-    if (durableItem) {
-      const amount = calculateAmount(durableItem);
-      results.push({
-        ingredient: durableItem,
-        suggestedAmount: amount,
-        reason: '耐放食材，增加丰富度',
-        priority: 'bonus'
-      });
-      selectedIds.add(durableItem.id);
+    // 计算每顿需要量
+    const perMeal = perMealConfig[normalizedName] || defaultPerMeal[category];
+    
+    // 计算总需求
+    let totalNeeded: number;
+    if (unit === 'count') {
+      // 按个数：总顿数 / 2（假设每顿用0.5个）或者更精细的计算
+      totalNeeded = Math.ceil(totalCredits / 2);
     } else {
-      // 如果没有耐放食材，随便补一个
-      const anyItem = availableIngredients.find(
-        i => !selectedIds.has(i.id) && i.category !== 'staple'
-      );
-      if (anyItem) {
-        const amount = calculateAmount(anyItem);
-        results.push({
-          ingredient: anyItem,
-          suggestedAmount: amount,
-          reason: '额外补充',
-          priority: 'bonus'
-        });
-      }
+      // 按克数
+      totalNeeded = perMeal * totalCredits;
     }
-  }
-
-  // 最后添加主食
-  const staple = availableIngredients.find(
-    i => i.category === 'staple' && !selectedIds.has(i.id)
-  );
-  if (staple) {
+    
+    // 查找现有库存
+    const existing = existingIngredients.find(ing => ing.name === normalizedName);
+    const existingQty = existing?.quantity || 0;
+    
+    // 计算需要购买的量
+    let needToBuy = Math.max(0, totalNeeded - existingQty);
+    
+    // 如果是按个数，向上取整
+    if (unit === 'count') {
+      needToBuy = Math.ceil(needToBuy);
+    } else {
+      // 按克数，取整到50g
+      needToBuy = Math.ceil(needToBuy / 50) * 50;
+    }
+    
     results.push({
-      ingredient: staple,
-      suggestedAmount: 80, // 主食固定80g
-      reason: '主食',
-      priority: 'base'
+      item: {
+        name: normalizedName,
+        category,
+        suggestedAmount: needToBuy,
+        unit,
+        plannedCredits: additionalCredits,
+        existingStock: existingQty,
+      },
+      existingStock: existingQty,
+      existingUnit: unit === 'count' ? '个' : 'g',
+      needToBuy,
+      totalNeeded,
     });
   }
-
+  
   return results;
 }
 
-/**
- * 计算单品建议量
- * 公式: 单品建议量 = 该品类当前库存 * (1 - 损耗系数) / 该品类剩余顿数
- * 肉类超过200g时截断为150g
- * 按个数的食材会计算出建议使用几个
- */
-function calculateAmount(ingredient: Ingredient): number {
-  const effectiveStock = ingredient.quantity * (1 - ingredient.lossRate);
-  let amount = effectiveStock / ingredient.remainingCredits;
-
-  if (ingredient.unit === 'count') {
-    // 按个数的食材，向上取整确保每顿至少1个
-    amount = Math.max(1, Math.ceil(amount));
+// ============ 获取不建议购买的食材（库存里有的老食材）============
+export function getDoNotBuyList(ingredients: Ingredient[]): Array<{name: string, reason: string}> {
+  const doNotBuy: Array<{name: string, reason: string}> = [];
+  
+  for (const ing of ingredients) {
+    const daysOld = getDaysSinceCreated(ing);
+    const params = defaultIngredientParams[ing.name];
+    const shelfLife = params?.shelfLife || 7;
     
-    // 如果库存不够每顿1个，就用完
-    if (amount > ingredient.quantity) {
-      amount = ingredient.quantity;
-    }
-  } else {
-    // 按克的食材
-    amount = Math.round(amount);
-    
-    // 肉类限制: 超过200g截断为150g
-    if (ingredient.category === 'meat' && amount > 200) {
-      amount = 150;
-    }
-
-    // 最小量保证
-    if (amount < 20) {
-      amount = 20;
+    if (daysOld >= 3 || ing.status === 'opened' || ing.remainingCredits <= 2) {
+      let reason = '';
+      if (ing.status === 'opened') {
+        reason = `已切开，请先吃完`;
+      } else if (daysOld >= shelfLife * 0.5) {
+        reason = `已存放${daysOld}天，请先吃掉`;
+      } else if (ing.remainingCredits <= 2) {
+        reason = `还剩${ing.quantity}${ing.unit === 'count' ? '个' : 'g'}，先吃完再买`;
+      } else {
+        reason = `冰箱里还有${ing.quantity}${ing.unit === 'count' ? '个' : 'g'}`;
+      }
+      
+      doNotBuy.push({ name: ing.name, reason });
     }
   }
-
-  return amount;
-}
-
-/**
- * 计算购买建议
- * 根据计划顿数和每顿需求量，反推应该购买的量
- * 支持按个数或按克的食材
- */
-export function calculateShoppingList(
-  plannedItems: { name: string; credits: number }[],
-  _totalCredits: number
-): { name: string; suggestedAmount: number; unit: string; note: string }[] {
-  return plannedItems.map(item => {
-    const defaultUnit = getDefaultUnit(item.name);
-    let perMealAmount: number;
-    let unit: string;
-    let note = '';
-
-    if (defaultUnit === 'count') {
-      // 按个数的食材
-      unit = '个';
-      perMealAmount = 1; // 默认每顿1个
-      
-      // 根据食材类型调整
-      if (item.name.includes('蛋') && !item.name.includes('鹌鹑')) {
-        perMealAmount = 2;
-        note = '鸡蛋每顿约2个';
-      } else if (item.name.includes('鹌鹑蛋')) {
-        perMealAmount = 5;
-        note = '鹌鹑蛋每顿约5个';
-      } else if (item.name.includes('西红柿') || item.name.includes('番茄')) {
-        perMealAmount = 1;
-        note = '每顿1个';
-      } else if (item.name.includes('土豆') || item.name.includes('红薯')) {
-        perMealAmount = 1;
-        note = '每顿1个，选中等大小的';
-      }
-      
-      const suggestedAmount = Math.ceil(perMealAmount * item.credits);
-      return { name: item.name, suggestedAmount, unit, note };
-    } else {
-      // 按克的食材
-      unit = 'g';
-      perMealAmount = 120; // 默认值
-
-      // 根据食材名称判断类型并调整
-      if (item.name.includes('肉') || item.name.includes('鸡') || item.name.includes('牛') || item.name.includes('猪')) {
-        perMealAmount = 130;
-        note = `约 ${Math.ceil((perMealAmount * item.credits) / 300)} 块`;
-      } else if (item.name.includes('菠菜') || item.name.includes('生菜') || item.name.includes('油麦菜')) {
-        perMealAmount = 150;
-        note = `约 1 大把。注意：${item.name}只能撑 ${item.credits} 顿，别买多`;
-      } else if (item.name.includes('菇')) {
-        perMealAmount = 80;
-        note = '约 1 包';
-      } else if (item.name.includes('面') || item.name.includes('米')) {
-        perMealAmount = 80;
-        note = '主食';
-      }
-
-      const suggestedAmount = perMealAmount * item.credits;
-      return { name: item.name, suggestedAmount, unit, note };
-    }
-  });
-}
-
-/**
- * 解析批量输入文本
- * 支持格式: 
- *   - "鸡胸肉800g，娃娃菜600g，菠菜500g"
- *   - "西红柿3个，鸡蛋6个"
- *   - "鸡胸肉 800g\n娃娃菜 600g"
- *   - 混合: "鸡胸肉800g，西红柿3个，菠菜500g"
- */
-export function parseBatchInput(text: string): { name: string; quantity: number; unit: 'g' | 'count' }[] {
-  const results: { name: string; quantity: number; unit: 'g' | 'count' }[] = [];
   
-  // 分隔符: 逗号、顿号、换行、分号
-  const items = text.split(/[,，、\n;；]+/).map(s => s.trim()).filter(Boolean);
+  return doNotBuy;
+}
+
+// ============ 解析用户输入 ============
+export function parseIngredientInput(input: string): Array<{
+  name: string;
+  quantity: number;
+  unit: 'g' | 'count';
+}> {
+  const results: Array<{ name: string; quantity: number; unit: 'g' | 'count' }> = [];
+  
+  // 支持多种分隔符
+  const items = input.split(/[，,、\n]+/).filter(Boolean);
   
   for (const item of items) {
-    // 匹配模式: 食材名 + 数字 + 单位(可选)
-    const match = item.match(/^(.+?)\s*(\d+(?:\.\d+)?)\s*(g|克|个|只|颗|根|块)?$/i);
+    const trimmed = item.trim();
+    if (!trimmed) continue;
+    
+    // 匹配模式：食材名 + 数量 + 单位
+    // 例如：鸡胸肉800g, 西红柿3个, 鸡蛋10个
+    const match = trimmed.match(/^(.+?)\s*(\d+(?:\.\d+)?)\s*(g|克|个|根|包|把|颗)?$/);
+    
     if (match) {
-      const name = match[1].trim();
+      const rawName = match[1].trim();
+      const name = normalizeIngredientName(rawName); // 使用别名识别
       const quantity = parseFloat(match[2]);
-      const unitStr = (match[3] || '').toLowerCase();
+      let unit: 'g' | 'count' = 'g';
       
-      // 判断单位
-      let unit: 'g' | 'count';
-      if (unitStr === '个' || unitStr === '只' || unitStr === '颗' || unitStr === '根' || unitStr === '块') {
-        // 用户明确指定了个数单位
+      const unitStr = match[3];
+      if (unitStr === '个' || unitStr === '根' || unitStr === '包' || unitStr === '把' || unitStr === '颗') {
         unit = 'count';
-      } else if (unitStr === 'g' || unitStr === '克') {
-        // 用户明确指定了克
-        unit = 'g';
       } else {
-        // 没有指定单位，根据食材名自动判断
-        unit = getDefaultUnit(name);
+        // 检查默认参数
+        const params = defaultIngredientParams[name];
+        if (params?.unit === 'count') {
+          unit = 'count';
+        }
       }
       
-      if (name && quantity > 0) {
-        results.push({ name, quantity, unit });
-      }
+      results.push({ name, quantity, unit });
+    } else {
+      // 只有食材名，没有数量
+      const name = normalizeIngredientName(trimmed);
+      results.push({ name, quantity: 0, unit: 'g' });
     }
   }
   
   return results;
 }
 
-/**
- * 根据食材名获取默认单位
- * 西红柿、鸡蛋、土豆等按个数更方便的食材会返回 'count'
- */
-export function getDefaultUnit(ingredientName: string): 'g' | 'count' {
-  // 首先检查是否在默认参数库中
-  for (const [name, params] of Object.entries(defaultIngredientParams)) {
-    if (ingredientName.includes(name) || name.includes(ingredientName)) {
-      return params.unit;
+// ============ 弹性乱炖算法 ============
+export function generateMealPlan(
+  ingredients: Ingredient[],
+  targetItemCount: 4 | 5
+): MealIngredient[] {
+  const selected: MealIngredient[] = [];
+  const used = new Set<string>();
+  
+  // 按优先级排序的食材
+  const sortedIngredients = [...ingredients].sort((a, b) => {
+    // 1. 已切开的优先
+    if (a.status === 'opened' && b.status !== 'opened') return -1;
+    if (b.status === 'opened' && a.status !== 'opened') return 1;
+    
+    // 2. 剩余顿数少的优先
+    if (a.remainingCredits !== b.remainingCredits) {
+      return a.remainingCredits - b.remainingCredits;
+    }
+    
+    // 3. 入库时间早的优先（越早入库越优先）
+    return a.createdAt - b.createdAt;
+  });
+  
+  // 辅助函数：计算建议用量
+  const calculateAmount = (ing: Ingredient): number => {
+    const effectiveStock = ing.quantity * (1 - ing.lossRate);
+    let amount = effectiveStock / ing.remainingCredits;
+    
+    // 肉类限额：超过200g强制截断为150g
+    if (ing.category === 'meat' && amount > 200) {
+      amount = 150;
+    }
+    
+    // 按个数的食材，取整
+    if (ing.unit === 'count') {
+      amount = Math.max(1, Math.round(amount));
+    } else {
+      amount = Math.round(amount / 10) * 10; // 四舍五入到10g
+    }
+    
+    return amount;
+  };
+  
+  // 辅助函数：添加食材到选品
+  const addIngredient = (ing: Ingredient, reason: string) => {
+    if (used.has(ing.id)) return false;
+    used.add(ing.id);
+    selected.push({
+      ingredientId: ing.id,
+      name: ing.name,
+      suggestedAmount: calculateAmount(ing),
+      unit: ing.unit,
+      reason,
+    });
+    return true;
+  };
+  
+  // Step 1: 强制位 - 已切开或即将过期的
+  for (const ing of sortedIngredients) {
+    if (selected.length >= targetItemCount) break;
+    if (ing.status === 'opened') {
+      addIngredient(ing, '已切开，必须用完');
+    } else if (ing.remainingCredits <= 1) {
+      addIngredient(ing, '即将吃完，优先使用');
     }
   }
   
-  // 模糊匹配一些常见按个数的食材
-  const countBasedPatterns = [
-    '蛋', '西红柿', '番茄', '土豆', '洋葱', '胡萝卜', '黄瓜', 
-    '茄子', '青椒', '辣椒', '玉米', '红薯', '紫薯', '西葫芦',
-    '萝卜', '豆腐', '娃娃菜', '杏鲍菇'
-  ];
+  // Step 2: 核心位 - 确保有肉和叶菜
+  const meats = sortedIngredients.filter(i => i.category === 'meat' && !used.has(i.id));
+  const leafy = sortedIngredients.filter(i => i.category === 'leafy' && !used.has(i.id));
   
-  for (const pattern of countBasedPatterns) {
-    if (ingredientName.includes(pattern)) {
-      return 'count';
+  if (meats.length > 0 && selected.length < targetItemCount) {
+    const meat = meats[0];
+    addIngredient(meat, '今日蛋白质来源');
+  }
+  
+  if (leafy.length > 0 && selected.length < targetItemCount) {
+    const leaf = leafy[0];
+    addIngredient(leaf, '补充膳食纤维');
+  }
+  
+  // Step 3: 填充位 - 根据CP搭配
+  const selectedMeat = selected.find(s => {
+    const ing = ingredients.find(i => i.id === s.ingredientId);
+    return ing?.category === 'meat';
+  });
+  
+  if (selectedMeat && selected.length < targetItemCount) {
+    const pairings = ingredientPairings[selectedMeat.name] || [];
+    for (const pairName of pairings) {
+      if (selected.length >= targetItemCount) break;
+      const pairIng = sortedIngredients.find(i => i.name === pairName && !used.has(i.id));
+      if (pairIng) {
+        addIngredient(pairIng, `与${selectedMeat.name}是绝配`);
+      }
     }
   }
   
-  // 默认按克
-  return 'g';
+  // Step 4: 继续填充 - 菌菇类
+  if (selected.length < targetItemCount) {
+    const mushrooms = sortedIngredients.filter(i => i.category === 'mushroom' && !used.has(i.id));
+    for (const m of mushrooms) {
+      if (selected.length >= targetItemCount) break;
+      addIngredient(m, '增鲜提味');
+    }
+  }
+  
+  // Step 5: 5品类时，从耐放食材中增补
+  if (targetItemCount === 5 && selected.length < 5) {
+    const durable = sortedIngredients.filter(
+      i => durableIngredients.includes(i.name) && !used.has(i.id)
+    );
+    for (const d of durable) {
+      if (selected.length >= 5) break;
+      addIngredient(d, '耐放食材，均衡搭配');
+    }
+  }
+  
+  // Step 6: 还不够就随便选
+  for (const ing of sortedIngredients) {
+    if (selected.length >= targetItemCount) break;
+    if (!used.has(ing.id)) {
+      addIngredient(ing, '补充品类');
+    }
+  }
+  
+  return selected;
+}
+
+// ============ 生成购物建议 ============
+export function generateShoppingList(
+  wantedItems: string[],
+  plannedCredits: number,
+  existingIngredients: Ingredient[] = []
+): ShoppingItem[] {
+  const shoppingList: ShoppingItem[] = [];
+  
+  // 每顿平均消耗量（克）
+  const perMealAmount: Record<IngredientCategory, number> = {
+    meat: 130,
+    leafy: 150,
+    mushroom: 80,
+    root: 120,
+    staple: 80,
+    other: 100,
+  };
+  
+  for (const itemName of wantedItems) {
+    const normalizedName = normalizeIngredientName(itemName);
+    const params = defaultIngredientParams[normalizedName];
+    const category = params?.category || 'other';
+    const unit = params?.unit || 'g';
+    const unitWeight = params?.unitWeight;
+    const shelfLife = params?.shelfLife || 7;
+    
+    // 计算建议购买量
+    let amount: number;
+    const itemCredits = Math.min(plannedCredits, shelfLife); // 不要买超过保质期的量
+    
+    if (unit === 'count' && unitWeight) {
+      // 按个数计算
+      const totalGrams = perMealAmount[category] * itemCredits;
+      amount = Math.ceil(totalGrams / unitWeight);
+    } else {
+      // 按克计算
+      amount = perMealAmount[category] * itemCredits;
+      // 向上取整到50g
+      amount = Math.ceil(amount / 50) * 50;
+    }
+    
+    // 检查现有库存
+    const existing = existingIngredients.find(i => i.name === normalizedName);
+    let warning: string | undefined;
+    let existingStock: number | undefined;
+    
+    if (existing) {
+      existingStock = existing.quantity;
+      const daysOld = getDaysSinceCreated(existing);
+      
+      if (existing.status === 'opened') {
+        warning = `⚠️ 已切开，请先吃完！`;
+      } else if (daysOld >= 3) {
+        warning = `⚠️ 已存放${daysOld}天，先吃掉再买！`;
+      } else {
+        warning = `冰箱里还有 ${existing.quantity}${unit === 'count' ? '个' : 'g'}`;
+        // 减去已有库存
+        if (unit === 'count') {
+          amount = Math.max(0, amount - existing.quantity);
+        } else {
+          amount = Math.max(0, amount - existing.quantity);
+          amount = Math.ceil(amount / 50) * 50;
+        }
+      }
+    }
+    
+    shoppingList.push({
+      name: normalizedName,
+      category,
+      suggestedAmount: amount,
+      unit,
+      plannedCredits: itemCredits,
+      existingStock,
+      warning,
+    });
+  }
+  
+  return shoppingList;
+}
+
+// ============ 计算最大剩余顿数 ============
+export function getMaxRemainingCredits(ingredients: Ingredient[]): number {
+  if (ingredients.length === 0) return 0;
+  return Math.max(...ingredients.map(i => i.remainingCredits));
 }
