@@ -25,7 +25,7 @@ import { cn } from './utils/cn';
 type ViewType = 'home' | 'stock' | 'cook' | 'shop';
 
 // ============ 主应用 ============
-export default function App() {
+export function App() {
   const [currentView, setCurrentView] = useState<ViewType>('home');
   const [ingredients, setIngredients] = useState<Ingredient[]>([]);
   const [mealPlans, setMealPlans] = useState<MealPlan[]>([]);
