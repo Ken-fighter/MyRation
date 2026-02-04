@@ -1,856 +1,873 @@
-import { useState, useEffect, useCallback } from 'react';
-import { Ingredient, RationResult, categoryLabels, categoryColors, defaultIngredientParams } from './types';
+import { useState, useEffect } from 'react';
 import {
-  getIngredients,
-  addIngredientsBatch,
-  updateIngredient,
-  deleteIngredient,
-  clearAllIngredients,
-  consumeIngredients,
-  saveMealRecord,
-  getGlobalCredits,
-  setGlobalCredits,
-  getPendingMeal,
-  setPendingMeal,
-  clearPendingMeal
-} from './store';
-import { calculateRation, parseBatchInput, calculateShoppingList } from './algorithm';
+  Ingredient,
+  MealPlan,
+  MealIngredient,
+  ShoppingItem,
+  IngredientCategory,
+  categoryNames,
+  categoryColors,
+  defaultIngredientParams,
+} from './types';
+import {
+  generateMealPlan,
+  generateShoppingList,
+  getMaxRemainingCredits,
+  parseIngredientInput,
+  normalizeIngredientName,
+  getStockWarnings,
+  getDoNotBuyList,
+  StockWarning,
+} from './algorithm';
+import { storage } from './store';
+import { cn } from './utils/cn';
 
-type View = 'home' | 'stock' | 'cook' | 'shop' | 'history';
+type ViewType = 'home' | 'stock' | 'cook' | 'shop';
 
-export function App() {
-  const [currentView, setCurrentView] = useState<View>('home');
+// ============ 主应用 ============
+export default function App() {
+  const [currentView, setCurrentView] = useState<ViewType>('home');
   const [ingredients, setIngredients] = useState<Ingredient[]>([]);
-  const [globalCredits, setGlobalCreditsState] = useState(6);
-  const [pendingMeal, setPendingMealState] = useState<{ ingredientId: string; ingredientName: string; suggestedAmount: number }[] | null>(null);
+  const [mealPlans, setMealPlans] = useState<MealPlan[]>([]);
+  const [lastMealConfirmed, setLastMealConfirmed] = useState(true);
 
   // 加载数据
-  const loadData = useCallback(() => {
-    setIngredients(getIngredients());
-    setGlobalCreditsState(getGlobalCredits());
-    setPendingMealState(getPendingMeal());
+  useEffect(() => {
+    setIngredients(storage.getIngredients());
+    setMealPlans(storage.getMealPlans());
+    setLastMealConfirmed(storage.getLastMealConfirmed());
   }, []);
 
-  useEffect(() => {
-    loadData();
-  }, [loadData]);
-
-  // 导航栏
-  const NavBar = () => (
-    <nav className="fixed bottom-0 left-0 right-0 bg-white border-t border-gray-200 shadow-lg z-50">
-      <div className="max-w-lg mx-auto flex justify-around">
-        {[
-          { view: 'home' as View, icon: '🏠', label: '首页' },
-          { view: 'stock' as View, icon: '📦', label: '入库' },
-          { view: 'cook' as View, icon: '🍳', label: '做饭' },
-          { view: 'shop' as View, icon: '🛒', label: '买菜' },
-        ].map(({ view, icon, label }) => (
-          <button
-            key={view}
-            onClick={() => setCurrentView(view)}
-            className={`flex flex-col items-center py-3 px-6 transition-all ${
-              currentView === view
-                ? 'text-emerald-600 scale-110'
-                : 'text-gray-500 hover:text-gray-700'
-            }`}
-          >
-            <span className="text-2xl">{icon}</span>
-            <span className="text-xs mt-1 font-medium">{label}</span>
-          </button>
-        ))}
-      </div>
-    </nav>
-  );
-
-  // 首页视图
-  const HomeView = () => {
-    const totalItems = ingredients.length;
-    const criticalItems = ingredients.filter(i => i.remainingCredits <= 1 || i.isOpened);
-    const maxCredits = Math.max(...ingredients.map(i => i.remainingCredits), 0);
-
-    return (
-      <div className="p-4 space-y-6">
-        <div className="text-center py-8">
-          <h1 className="text-3xl font-bold text-gray-800 mb-2">🍲 MyRation</h1>
-          <p className="text-gray-500">个人食材库存配给系统</p>
-        </div>
-
-        {/* 状态卡片 */}
-        <div className="grid grid-cols-2 gap-4">
-          <div className="bg-gradient-to-br from-emerald-400 to-emerald-600 rounded-2xl p-4 text-white shadow-lg">
-            <div className="text-4xl font-bold">{totalItems}</div>
-            <div className="text-emerald-100 text-sm">种食材在库</div>
-          </div>
-          <div className="bg-gradient-to-br from-orange-400 to-red-500 rounded-2xl p-4 text-white shadow-lg">
-            <div className="text-4xl font-bold">{maxCredits}</div>
-            <div className="text-orange-100 text-sm">最大剩余顿数</div>
-          </div>
-        </div>
-
-        {/* 待确认餐食 */}
-        {pendingMeal && pendingMeal.length > 0 && (
-          <div className="bg-yellow-50 border-2 border-yellow-300 rounded-2xl p-4">
-            <h3 className="font-bold text-yellow-800 mb-3">⚠️ 请确认上一顿的执行情况</h3>
-            <div className="space-y-2 mb-4">
-              {pendingMeal.map((item, idx) => {
-                const ing = ingredients.find(i => i.id === item.ingredientId);
-                const unit = ing?.unit === 'count' ? '个' : 'g';
-                return (
-                  <div key={idx} className="text-sm text-yellow-700">
-                    {item.ingredientName}: {item.suggestedAmount}{unit}
-                  </div>
-                );
-              })}
-            </div>
-            <div className="flex gap-2">
-              <button
-                onClick={() => handleConfirmMeal('completed')}
-                className="flex-1 bg-emerald-500 text-white py-2 rounded-lg font-medium hover:bg-emerald-600 transition"
-              >
-                ✅ 按计划执行
-              </button>
-              <button
-                onClick={() => handleConfirmMeal('skipped')}
-                className="flex-1 bg-gray-500 text-white py-2 rounded-lg font-medium hover:bg-gray-600 transition"
-              >
-                🍕 外出就餐
-              </button>
-            </div>
-            <button
-              onClick={() => setCurrentView('cook')}
-              className="w-full mt-2 bg-orange-500 text-white py-2 rounded-lg font-medium hover:bg-orange-600 transition"
-            >
-              ✏️ 手动修正用量
-            </button>
-          </div>
-        )}
-
-        {/* 紧急提醒 */}
-        {criticalItems.length > 0 && (
-          <div className="bg-red-50 border border-red-200 rounded-2xl p-4">
-            <h3 className="font-bold text-red-700 mb-2">🚨 需要优先处理</h3>
-            <div className="space-y-2">
-              {criticalItems.map(item => (
-                <div key={item.id} className="flex items-center justify-between text-sm">
-                  <span className="text-red-600">{item.name}</span>
-                  <span className="text-red-500">
-                    {item.isOpened ? '已切开' : `仅剩${item.remainingCredits}顿`}
-                  </span>
-                </div>
-              ))}
-            </div>
-          </div>
-        )}
-
-        {/* 库存概览 */}
-        {ingredients.length > 0 ? (
-          <div className="bg-white rounded-2xl shadow-md p-4">
-            <h3 className="font-bold text-gray-700 mb-3">📋 库存概览</h3>
-            <div className="space-y-2">
-              {ingredients.slice(0, 5).map(item => (
-                <div key={item.id} className="flex items-center justify-between text-sm">
-                  <div className="flex items-center gap-2">
-                    <span className={`px-2 py-0.5 rounded text-xs ${categoryColors[item.category]}`}>
-                      {categoryLabels[item.category].split(' ')[0]}
-                    </span>
-                    <span className="text-gray-700">{item.name}</span>
-                  </div>
-                  <div className="text-gray-500">
-                    {item.quantity}{item.unit === 'g' ? 'g' : '个'} · {item.remainingCredits}顿
-                  </div>
-                </div>
-              ))}
-              {ingredients.length > 5 && (
-                <div className="text-center text-gray-400 text-sm pt-2">
-                  还有 {ingredients.length - 5} 种食材...
-                </div>
-              )}
-            </div>
-          </div>
-        ) : (
-          <div className="bg-gray-50 rounded-2xl p-8 text-center">
-            <div className="text-6xl mb-4">🥬</div>
-            <p className="text-gray-500 mb-4">冰箱空空如也</p>
-            <button
-              onClick={() => setCurrentView('stock')}
-              className="bg-emerald-500 text-white px-6 py-2 rounded-lg font-medium hover:bg-emerald-600 transition"
-            >
-              去入库
-            </button>
-          </div>
-        )}
-      </div>
-    );
+  // 保存食材
+  const saveIngredients = (newIngredients: Ingredient[]) => {
+    setIngredients(newIngredients);
+    storage.saveIngredients(newIngredients);
   };
 
-  // 处理确认餐食
-  const handleConfirmMeal = (status: 'completed' | 'skipped') => {
-    if (!pendingMeal) return;
+  // 保存用餐计划
+  const saveMealPlans = (newPlans: MealPlan[]) => {
+    setMealPlans(newPlans);
+    storage.saveMealPlans(newPlans);
+  };
 
-    if (status === 'completed') {
-      // 按计划执行 - 扣减库存和顿数
-      const consumptions = pendingMeal.map(item => ({
-        id: item.ingredientId,
-        amount: item.suggestedAmount
-      }));
-      consumeIngredients(consumptions);
+  // 确认上一餐
+  const confirmLastMeal = (action: 'completed' | 'skipped' | 'modified', modifications?: Record<string, number>) => {
+    if (action === 'completed') {
+      // 按计划执行，扣减库存
+      const lastPlan = mealPlans[mealPlans.length - 1];
+      if (lastPlan && lastPlan.status === 'planned') {
+        const updatedIngredients = ingredients.map(ing => {
+          const mealIng = lastPlan.ingredients.find(mi => mi.ingredientId === ing.id);
+          if (mealIng) {
+            return {
+              ...ing,
+              quantity: Math.max(0, ing.quantity - mealIng.suggestedAmount),
+              remainingCredits: Math.max(0, ing.remainingCredits - 1),
+            };
+          }
+          return ing;
+        }).filter(ing => ing.quantity > 0);
+        
+        saveIngredients(updatedIngredients);
+        
+        const updatedPlans = mealPlans.map(p => 
+          p.id === lastPlan.id ? { ...p, status: 'completed' as const, completedAt: Date.now() } : p
+        );
+        saveMealPlans(updatedPlans);
+      }
+    } else if (action === 'modified' && modifications) {
+      // 手动修正
+      const updatedIngredients = ingredients.map(ing => {
+        const actualAmount = modifications[ing.id];
+        if (actualAmount !== undefined) {
+          return {
+            ...ing,
+            quantity: Math.max(0, ing.quantity - actualAmount),
+            remainingCredits: Math.max(0, ing.remainingCredits - 1),
+          };
+        }
+        return ing;
+      }).filter(ing => ing.quantity > 0);
+      
+      saveIngredients(updatedIngredients);
+    }
+    
+    setLastMealConfirmed(true);
+    storage.saveLastMealConfirmed(true);
+  };
 
-      saveMealRecord({
-        timestamp: Date.now(),
-        items: pendingMeal.map(item => ({
-          ingredientId: item.ingredientId,
-          ingredientName: item.ingredientName,
-          plannedAmount: item.suggestedAmount,
-          actualAmount: item.suggestedAmount
-        })),
-        status: 'completed'
-      });
-    } else {
-      // 外出就餐 - 不扣减
-      saveMealRecord({
-        timestamp: Date.now(),
-        items: pendingMeal.map(item => ({
-          ingredientId: item.ingredientId,
-          ingredientName: item.ingredientName,
-          plannedAmount: item.suggestedAmount,
-          actualAmount: 0
-        })),
-        status: 'skipped'
-      });
+  return (
+    <div className="min-h-screen bg-gradient-to-br from-green-50 to-blue-50">
+      {/* 顶部标题 */}
+      <header className="bg-white shadow-sm sticky top-0 z-10">
+        <div className="max-w-lg mx-auto px-4 py-4">
+          <h1 className="text-2xl font-bold text-center bg-gradient-to-r from-green-600 to-blue-600 bg-clip-text text-transparent">
+            🍲 MyRation
+          </h1>
+          <p className="text-center text-gray-500 text-sm">智能食材配给系统</p>
+        </div>
+      </header>
+
+      {/* 主内容区 */}
+      <main className="max-w-lg mx-auto px-4 py-6 pb-24">
+        {currentView === 'home' && (
+          <HomeView 
+            ingredients={ingredients}
+            lastMealConfirmed={lastMealConfirmed}
+            onConfirmMeal={confirmLastMeal}
+          />
+        )}
+        {currentView === 'stock' && (
+          <StockView 
+            ingredients={ingredients}
+            onSave={saveIngredients}
+          />
+        )}
+        {currentView === 'cook' && (
+          <CookView 
+            ingredients={ingredients}
+            onSaveIngredients={saveIngredients}
+            onSaveMealPlan={(plan) => saveMealPlans([...mealPlans, plan])}
+          />
+        )}
+        {currentView === 'shop' && (
+          <ShopView ingredients={ingredients} />
+        )}
+      </main>
+
+      {/* 底部导航 */}
+      <nav className="fixed bottom-0 left-0 right-0 bg-white border-t shadow-lg">
+        <div className="max-w-lg mx-auto flex justify-around py-2">
+          {[
+            { id: 'home', icon: '🏠', label: '首页' },
+            { id: 'stock', icon: '📦', label: '入库' },
+            { id: 'cook', icon: '🍳', label: '做饭' },
+            { id: 'shop', icon: '🛒', label: '买菜' },
+          ].map(item => (
+            <button
+              key={item.id}
+              onClick={() => setCurrentView(item.id as ViewType)}
+              className={cn(
+                'flex flex-col items-center px-4 py-2 rounded-lg transition-all',
+                currentView === item.id 
+                  ? 'bg-green-100 text-green-700' 
+                  : 'text-gray-500 hover:bg-gray-100'
+              )}
+            >
+              <span className="text-2xl">{item.icon}</span>
+              <span className="text-xs mt-1">{item.label}</span>
+            </button>
+          ))}
+        </div>
+      </nav>
+    </div>
+  );
+}
+
+// ============ 首页视图 ============
+function HomeView({ 
+  ingredients, 
+  lastMealConfirmed, 
+  onConfirmMeal 
+}: { 
+  ingredients: Ingredient[];
+  lastMealConfirmed: boolean;
+  onConfirmMeal: (action: 'completed' | 'skipped' | 'modified', modifications?: Record<string, number>) => void;
+}) {
+  const maxCredits = getMaxRemainingCredits(ingredients);
+  const stockWarnings = getStockWarnings(ingredients);
+  const criticalItems = stockWarnings.filter(w => w.type === 'opened' || w.type === 'expiring');
+
+  return (
+    <div className="space-y-6">
+      {/* 库存概览卡片 */}
+      <div className="bg-white rounded-2xl shadow-md p-6">
+        <h2 className="text-lg font-semibold text-gray-800 mb-4">📊 库存概览</h2>
+        <div className="grid grid-cols-2 gap-4">
+          <div className="bg-green-50 rounded-xl p-4 text-center">
+            <div className="text-3xl font-bold text-green-600">{ingredients.length}</div>
+            <div className="text-sm text-gray-600">食材种类</div>
+          </div>
+          <div className="bg-blue-50 rounded-xl p-4 text-center">
+            <div className="text-3xl font-bold text-blue-600">{maxCredits}</div>
+            <div className="text-sm text-gray-600">最大剩余顿数</div>
+          </div>
+        </div>
+      </div>
+
+      {/* 库存警告 */}
+      {stockWarnings.length > 0 && (
+        <div className="bg-white rounded-2xl shadow-md p-6">
+          <h2 className="text-lg font-semibold text-gray-800 mb-4">⚠️ 库存提醒</h2>
+          <div className="space-y-2">
+            {stockWarnings.map((warning, idx) => (
+              <div 
+                key={idx}
+                className={cn(
+                  "p-3 rounded-lg text-sm",
+                  warning.type === 'opened' ? 'bg-red-50 text-red-700' :
+                  warning.type === 'expiring' ? 'bg-orange-50 text-orange-700' :
+                  'bg-yellow-50 text-yellow-700'
+                )}
+              >
+                {warning.message}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* 紧急食材 */}
+      {criticalItems.length > 0 && (
+        <div className="bg-red-50 rounded-2xl shadow-md p-6 border-2 border-red-200">
+          <h2 className="text-lg font-semibold text-red-700 mb-4">🚨 请立即处理</h2>
+          <div className="space-y-2">
+            {criticalItems.map((item, idx) => (
+              <div key={idx} className="flex justify-between items-center bg-white p-3 rounded-lg">
+                <span className="font-medium">{item.ingredient.name}</span>
+                <span className="text-sm text-red-600">
+                  {item.ingredient.quantity}{item.ingredient.unit === 'count' ? '个' : 'g'}
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* 上一餐确认 */}
+      {!lastMealConfirmed && (
+        <div className="bg-amber-50 rounded-2xl shadow-md p-6 border-2 border-amber-200">
+          <h2 className="text-lg font-semibold text-amber-700 mb-4">📋 确认上一餐</h2>
+          <div className="space-y-3">
+            <button
+              onClick={() => onConfirmMeal('completed')}
+              className="w-full py-3 bg-green-500 text-white rounded-xl font-medium hover:bg-green-600 transition"
+            >
+              ✅ 按计划执行了
+            </button>
+            <button
+              onClick={() => onConfirmMeal('skipped')}
+              className="w-full py-3 bg-gray-500 text-white rounded-xl font-medium hover:bg-gray-600 transition"
+            >
+              🍕 外出就餐了
+            </button>
+            <button
+              onClick={() => {/* TODO: 打开修正弹窗 */}}
+              className="w-full py-3 bg-amber-500 text-white rounded-xl font-medium hover:bg-amber-600 transition"
+            >
+              ✏️ 需要手动修正
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* 食材列表 */}
+      {ingredients.length > 0 && (
+        <div className="bg-white rounded-2xl shadow-md p-6">
+          <h2 className="text-lg font-semibold text-gray-800 mb-4">🥗 当前库存</h2>
+          <div className="space-y-3">
+            {ingredients.map(ing => (
+              <div key={ing.id} className="flex items-center justify-between p-3 bg-gray-50 rounded-xl">
+                <div className="flex items-center gap-3">
+                  <span className={cn('px-2 py-1 rounded-full text-xs', categoryColors[ing.category])}>
+                    {categoryNames[ing.category]}
+                  </span>
+                  <span className="font-medium">{ing.name}</span>
+                  {ing.status === 'opened' && <span className="text-red-500 text-xs">已切开</span>}
+                </div>
+                <div className="text-right">
+                  <div className="font-semibold">{ing.quantity}{ing.unit === 'count' ? '个' : 'g'}</div>
+                  <div className="text-xs text-gray-500">剩余{ing.remainingCredits}顿</div>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* 空状态 */}
+      {ingredients.length === 0 && (
+        <div className="bg-white rounded-2xl shadow-md p-12 text-center">
+          <div className="text-6xl mb-4">🥬</div>
+          <h3 className="text-xl font-semibold text-gray-700 mb-2">冰箱空空如也</h3>
+          <p className="text-gray-500">点击下方"入库"开始添加食材</p>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ============ 入库视图 ============
+function StockView({ 
+  ingredients, 
+  onSave 
+}: { 
+  ingredients: Ingredient[];
+  onSave: (ingredients: Ingredient[]) => void;
+}) {
+  const [input, setInput] = useState('');
+  const [globalCredits, setGlobalCredits] = useState(6);
+  const [parsedItems, setParsedItems] = useState<Array<{
+    name: string;
+    quantity: number;
+    unit: 'g' | 'count';
+    category: IngredientCategory;
+    credits: number;
+  }>>([]);
+  const [step, setStep] = useState<'input' | 'preview'>('input');
+
+  const handleParse = () => {
+    const parsed = parseIngredientInput(input);
+    const items = parsed.map(p => {
+      const params = defaultIngredientParams[p.name];
+      return {
+        name: p.name,
+        quantity: p.quantity,
+        unit: p.unit,
+        category: (params?.category || 'other') as IngredientCategory,
+        credits: globalCredits,
+      };
+    });
+    setParsedItems(items);
+    setStep('preview');
+  };
+
+  const handleSave = () => {
+    const newIngredients: Ingredient[] = parsedItems.map(item => {
+      const params = defaultIngredientParams[item.name];
+      // 检查是否已存在
+      const existing = ingredients.find(i => i.name === item.name);
+      
+      if (existing) {
+        // 合并库存
+        return {
+          ...existing,
+          quantity: existing.quantity + item.quantity,
+          remainingCredits: Math.max(existing.remainingCredits, item.credits),
+          updatedAt: Date.now(),
+        };
+      }
+      
+      return {
+        id: crypto.randomUUID(),
+        name: item.name,
+        category: item.category,
+        quantity: item.quantity,
+        unit: item.unit,
+        remainingCredits: item.credits,
+        status: 'fresh' as const,
+        lossRate: params?.lossRate || 0.1,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      };
+    });
+
+    // 合并新旧库存
+    const mergedIngredients = [...ingredients];
+    for (const newIng of newIngredients) {
+      const existingIdx = mergedIngredients.findIndex(i => i.name === newIng.name);
+      if (existingIdx >= 0) {
+        mergedIngredients[existingIdx] = newIng;
+      } else {
+        mergedIngredients.push(newIng);
+      }
     }
 
-    clearPendingMeal();
-    loadData();
+    onSave(mergedIngredients);
+    setInput('');
+    setParsedItems([]);
+    setStep('input');
+    alert('✅ 入库成功！新老库存已合并。');
   };
 
-  // 入库视图
-  const StockView = () => {
-    const [batchInput, setBatchInput] = useState('');
-    const [localCredits, setLocalCreditsState] = useState(globalCredits);
-    const [parsedItems, setParsedItems] = useState<{ name: string; quantity: number; unit: 'g' | 'count'; credits: number }[]>([]);
-    const [showParsed, setShowParsed] = useState(false);
-
-    // 解析输入
-    const handleParse = () => {
-      const parsed = parseBatchInput(batchInput);
-      setParsedItems(parsed.map(item => ({
-        ...item,
-        credits: localCredits
-      })));
-      setShowParsed(true);
-    };
-
-    // 修改单个食材顿数
-    const updateItemCredits = (index: number, credits: number) => {
-      const updated = [...parsedItems];
-      updated[index].credits = credits;
-      setParsedItems(updated);
-    };
-
-    // 切换单位
-    const toggleItemUnit = (index: number) => {
-      const updated = [...parsedItems];
-      updated[index].unit = updated[index].unit === 'g' ? 'count' : 'g';
-      setParsedItems(updated);
-    };
-
-    // 确认入库
-    const handleConfirmStock = () => {
-      const newIngredients = parsedItems.map(item => {
-        const defaults = defaultIngredientParams[item.name] || { category: 'other' as const, lossRate: 0.1 };
-        return {
-          name: item.name,
-          category: defaults.category,
-          quantity: item.quantity,
-          unit: item.unit,
-          remainingCredits: item.credits,
-          isOpened: false,
-          lossRate: defaults.lossRate
-        };
-      });
-
-      addIngredientsBatch(newIngredients);
-      setGlobalCredits(localCredits);
-
-      setBatchInput('');
-      setParsedItems([]);
-      setShowParsed(false);
-      loadData();
-
-      alert(`✅ 入库完成！已添加 ${newIngredients.length} 种食材`);
-    };
-
-    return (
-      <div className="p-4 space-y-6">
-        <h2 className="text-2xl font-bold text-gray-800">📦 食材入库</h2>
-
-        {/* 全局顿数设置 */}
-        <div className="bg-emerald-50 rounded-2xl p-4">
-          <label className="block text-sm font-medium text-emerald-700 mb-2">
-            这批菜计划吃几顿？
-          </label>
-          <div className="flex items-center gap-2">
-            {[4, 5, 6, 7, 8].map(n => (
-              <button
-                key={n}
-                onClick={() => setLocalCreditsState(n)}
-                className={`w-12 h-12 rounded-xl font-bold text-lg transition ${
-                  localCredits === n
-                    ? 'bg-emerald-500 text-white shadow-lg scale-110'
-                    : 'bg-white text-gray-600 hover:bg-emerald-100'
-                }`}
-              >
-                {n}
-              </button>
-            ))}
-            <span className="text-emerald-600 font-medium ml-2">顿</span>
-          </div>
-        </div>
-
-        {/* 批量输入 */}
-        <div className="bg-white rounded-2xl shadow-md p-4">
-          <label className="block text-sm font-medium text-gray-700 mb-2">
-            批量输入食材
-          </label>
-          <p className="text-xs text-gray-500 mb-2">
-            💡 支持：鸡胸肉800g、西红柿3个、鸡蛋6个
-          </p>
-          <textarea
-            value={batchInput}
-            onChange={(e) => setBatchInput(e.target.value)}
-            placeholder="鸡胸肉800g，西红柿3个，菠菜500g，鸡蛋6个，荞麦面400g"
-            className="w-full h-32 p-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-emerald-500 focus:border-transparent resize-none"
-          />
-          <button
-            onClick={handleParse}
-            disabled={!batchInput.trim()}
-            className="w-full mt-3 bg-emerald-500 text-white py-3 rounded-xl font-medium hover:bg-emerald-600 transition disabled:opacity-50 disabled:cursor-not-allowed"
-          >
-            解析并预览
-          </button>
-        </div>
-
-        {/* 解析结果 */}
-        {showParsed && parsedItems.length > 0 && (
-          <div className="bg-white rounded-2xl shadow-md p-4">
-            <h3 className="font-bold text-gray-700 mb-3">📋 确认入库清单</h3>
-            <div className="space-y-3">
-              {parsedItems.map((item, idx) => {
-                const defaults = defaultIngredientParams[item.name];
-                return (
-                  <div key={idx} className="flex items-center justify-between p-3 bg-gray-50 rounded-xl">
-                    <div className="flex items-center gap-2">
-                      <span className={`px-2 py-0.5 rounded text-xs ${
-                        defaults ? categoryColors[defaults.category] : 'bg-gray-100 text-gray-600'
-                      }`}>
-                        {defaults ? categoryLabels[defaults.category].split(' ')[0] : '🥗'}
-                      </span>
-                      <span className="font-medium">{item.name}</span>
-                      <span className="text-gray-500 text-sm">
-                        {item.quantity}
-                      </span>
-                      <button
-                        onClick={() => toggleItemUnit(idx)}
-                        className={`px-2 py-0.5 rounded text-xs font-medium transition ${
-                          item.unit === 'count' 
-                            ? 'bg-purple-100 text-purple-600' 
-                            : 'bg-gray-200 text-gray-600'
-                        }`}
-                      >
-                        {item.unit === 'g' ? '克' : '个'}
-                      </button>
-                    </div>
-                    <div className="flex items-center gap-2">
-                      <button
-                        onClick={() => updateItemCredits(idx, Math.max(1, item.credits - 1))}
-                        className="w-8 h-8 rounded-lg bg-gray-200 hover:bg-gray-300 font-bold"
-                      >
-                        -
-                      </button>
-                      <span className="w-8 text-center font-bold text-emerald-600">{item.credits}</span>
-                      <button
-                        onClick={() => updateItemCredits(idx, item.credits + 1)}
-                        className="w-8 h-8 rounded-lg bg-gray-200 hover:bg-gray-300 font-bold"
-                      >
-                        +
-                      </button>
-                      <span className="text-gray-500 text-sm">顿</span>
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-            <button
-              onClick={handleConfirmStock}
-              className="w-full mt-4 bg-gradient-to-r from-emerald-500 to-green-600 text-white py-3 rounded-xl font-bold text-lg hover:opacity-90 transition shadow-lg"
-            >
-              ✅ 确认入库
-            </button>
-          </div>
-        )}
-
-        {/* 当前库存 */}
-        {ingredients.length > 0 && (
-          <div className="bg-white rounded-2xl shadow-md p-4">
-            <div className="flex items-center justify-between mb-3">
-              <h3 className="font-bold text-gray-700">📦 当前库存</h3>
-              <button
-                onClick={() => {
-                  if (confirm('确定要清空所有库存吗？')) {
-                    clearAllIngredients();
-                    loadData();
-                  }
-                }}
-                className="text-red-500 text-sm hover:text-red-700"
-              >
-                清空全部
-              </button>
-            </div>
-            <div className="space-y-2">
-              {ingredients.map(item => (
-                <div key={item.id} className="flex items-center justify-between p-2 hover:bg-gray-50 rounded-lg group">
-                  <div className="flex items-center gap-2">
-                    <span className={`px-2 py-0.5 rounded text-xs ${categoryColors[item.category]}`}>
-                      {categoryLabels[item.category].split(' ')[0]}
-                    </span>
-                    <span>{item.name}</span>
-                    <span className="text-gray-500 text-sm">
-                      {item.quantity}{item.unit === 'g' ? 'g' : '个'}
-                    </span>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <button
-                      onClick={() => {
-                        updateIngredient(item.id, { isOpened: !item.isOpened });
-                        loadData();
-                      }}
-                      className={`text-xs px-2 py-1 rounded ${
-                        item.isOpened 
-                          ? 'bg-orange-100 text-orange-600' 
-                          : 'bg-gray-100 text-gray-500'
-                      }`}
-                    >
-                      {item.isOpened ? '已切开' : '未开封'}
-                    </button>
-                    <span className="text-emerald-600 font-medium">{item.remainingCredits}顿</span>
-                    <button
-                      onClick={() => {
-                        deleteIngredient(item.id);
-                        loadData();
-                      }}
-                      className="opacity-0 group-hover:opacity-100 text-red-400 hover:text-red-600 transition"
-                    >
-                      ×
-                    </button>
-                  </div>
-                </div>
-              ))}
-            </div>
-          </div>
-        )}
-      </div>
-    );
+  const updateItemCredits = (index: number, credits: number) => {
+    setParsedItems(items => items.map((item, i) => 
+      i === index ? { ...item, credits } : item
+    ));
   };
 
-  // 做饭视图
-  const CookView = () => {
-    const [targetCount, setTargetCount] = useState<4 | 5>(4);
-    const [rationResults, setRationResults] = useState<RationResult[]>([]);
-    const [showRation, setShowRation] = useState(false);
-    const [actualAmounts, setActualAmounts] = useState<Record<string, number>>({});
-    const [showModify, setShowModify] = useState(false);
+  const updateItemUnit = (index: number, unit: 'g' | 'count') => {
+    setParsedItems(items => items.map((item, i) => 
+      i === index ? { ...item, unit } : item
+    ));
+  };
 
-    // 生成配给
-    const handleGenerateRation = () => {
-      const results = calculateRation(ingredients, targetCount);
-      setRationResults(results);
-      setActualAmounts(
-        Object.fromEntries(results.map(r => [r.ingredient.id, r.suggestedAmount]))
-      );
-      setShowRation(true);
-    };
-
-    // 确认做饭
-    const handleConfirmCook = (modified: boolean) => {
-      const mealItems = rationResults.map(r => ({
-        ingredientId: r.ingredient.id,
-        ingredientName: r.ingredient.name,
-        suggestedAmount: r.suggestedAmount
-      }));
-
-      if (modified) {
-        // 使用实际用量扣减
-        const consumptions = rationResults.map(r => ({
-          id: r.ingredient.id,
-          amount: actualAmounts[r.ingredient.id] || r.suggestedAmount
-        }));
-        consumeIngredients(consumptions);
-
-        saveMealRecord({
-          timestamp: Date.now(),
-          items: rationResults.map(r => ({
-            ingredientId: r.ingredient.id,
-            ingredientName: r.ingredient.name,
-            plannedAmount: r.suggestedAmount,
-            actualAmount: actualAmounts[r.ingredient.id] || r.suggestedAmount
-          })),
-          status: 'modified'
-        });
-
-        clearPendingMeal();
-      } else {
-        // 保存待确认状态
-        setPendingMeal(mealItems);
-      }
-
-      loadData();
-      setShowRation(false);
-      setShowModify(false);
-      
-      if (modified) {
-        alert('✅ 已记录本顿用量');
-      } else {
-        alert('🍳 开始做饭！做完后请确认执行情况');
-      }
-    };
-
-    const priorityLabels = {
-      critical: { text: '必吃', color: 'bg-red-100 text-red-600' },
-      base: { text: '核心', color: 'bg-emerald-100 text-emerald-600' },
-      filler: { text: '搭配', color: 'bg-blue-100 text-blue-600' },
-      bonus: { text: '加餐', color: 'bg-purple-100 text-purple-600' }
-    };
-
-    return (
-      <div className="p-4 space-y-6">
-        <h2 className="text-2xl font-bold text-gray-800">🍳 开始做饭</h2>
-
-        {ingredients.length === 0 ? (
-          <div className="bg-gray-50 rounded-2xl p-8 text-center">
-            <div className="text-6xl mb-4">🥬</div>
-            <p className="text-gray-500">库存为空，请先入库食材</p>
-          </div>
-        ) : !showRation ? (
+  return (
+    <div className="space-y-6">
+      <div className="bg-white rounded-2xl shadow-md p-6">
+        <h2 className="text-lg font-semibold text-gray-800 mb-4">📦 食材入库</h2>
+        
+        {step === 'input' ? (
           <>
-            {/* 丰富度选择 */}
-            <div className="bg-white rounded-2xl shadow-md p-6">
-              <h3 className="font-bold text-gray-700 mb-4">今天想吃几样？</h3>
-              <div className="flex gap-4">
-                <button
-                  onClick={() => setTargetCount(4)}
-                  className={`flex-1 py-6 rounded-2xl font-bold text-xl transition ${
-                    targetCount === 4
-                      ? 'bg-gradient-to-br from-emerald-400 to-emerald-600 text-white shadow-lg scale-105'
-                      : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
-                  }`}
-                >
-                  <div className="text-3xl mb-2">4️⃣</div>
-                  4 品类
-                  <div className="text-sm font-normal opacity-80">经典搭配</div>
-                </button>
-                <button
-                  onClick={() => setTargetCount(5)}
-                  className={`flex-1 py-6 rounded-2xl font-bold text-xl transition ${
-                    targetCount === 5
-                      ? 'bg-gradient-to-br from-orange-400 to-red-500 text-white shadow-lg scale-105'
-                      : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
-                  }`}
-                >
-                  <div className="text-3xl mb-2">5️⃣</div>
-                  5 品类
-                  <div className="text-sm font-normal opacity-80">丰盛大餐</div>
-                </button>
+            {/* 全局顿数设置 */}
+            <div className="mb-4">
+              <label className="block text-sm font-medium text-gray-700 mb-2">
+                这批菜计划吃几顿？
+              </label>
+              <div className="flex gap-2">
+                {[4, 5, 6, 7, 8].map(n => (
+                  <button
+                    key={n}
+                    onClick={() => setGlobalCredits(n)}
+                    className={cn(
+                      'px-4 py-2 rounded-lg font-medium transition',
+                      globalCredits === n
+                        ? 'bg-green-500 text-white'
+                        : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
+                    )}
+                  >
+                    {n}顿
+                  </button>
+                ))}
               </div>
             </div>
 
+            {/* 批量输入 */}
+            <div className="mb-4">
+              <label className="block text-sm font-medium text-gray-700 mb-2">
+                批量输入食材（支持别名，如"番茄"会自动识别为"西红柿"）
+              </label>
+              <textarea
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+                placeholder="例如：鸡胸肉800g，番茄3个，菠菜500g，金针菇1包"
+                className="w-full h-32 p-3 border rounded-xl focus:ring-2 focus:ring-green-500 focus:border-green-500"
+              />
+              <p className="text-xs text-gray-500 mt-1">
+                💡 支持的单位：g/克、个、根、包、把
+              </p>
+            </div>
+
             <button
-              onClick={handleGenerateRation}
-              className="w-full bg-gradient-to-r from-orange-500 to-red-500 text-white py-4 rounded-2xl font-bold text-lg hover:opacity-90 transition shadow-lg"
+              onClick={handleParse}
+              disabled={!input.trim()}
+              className="w-full py-3 bg-green-500 text-white rounded-xl font-medium hover:bg-green-600 transition disabled:bg-gray-300"
+            >
+              下一步：预览确认
+            </button>
+          </>
+        ) : (
+          <>
+            {/* 预览和微调 */}
+            <div className="mb-4 space-y-3">
+              {parsedItems.map((item, idx) => (
+                <div key={idx} className="p-4 bg-gray-50 rounded-xl">
+                  <div className="flex items-center justify-between mb-3">
+                    <div className="flex items-center gap-2">
+                      <span className={cn('px-2 py-1 rounded-full text-xs', categoryColors[item.category])}>
+                        {categoryNames[item.category]}
+                      </span>
+                      <span className="font-semibold">{item.name}</span>
+                    </div>
+                    <span className="font-medium">{item.quantity}{item.unit === 'count' ? '个' : 'g'}</span>
+                  </div>
+                  
+                  {/* 单位切换 */}
+                  <div className="flex items-center gap-2 mb-2">
+                    <span className="text-sm text-gray-600">单位：</span>
+                    <button
+                      onClick={() => updateItemUnit(idx, 'g')}
+                      className={cn(
+                        'px-3 py-1 rounded-lg text-sm',
+                        item.unit === 'g' ? 'bg-blue-500 text-white' : 'bg-gray-200'
+                      )}
+                    >
+                      克(g)
+                    </button>
+                    <button
+                      onClick={() => updateItemUnit(idx, 'count')}
+                      className={cn(
+                        'px-3 py-1 rounded-lg text-sm',
+                        item.unit === 'count' ? 'bg-blue-500 text-white' : 'bg-gray-200'
+                      )}
+                    >
+                      个数
+                    </button>
+                  </div>
+                  
+                  {/* 顿数调整 */}
+                  <div className="flex items-center justify-between">
+                    <span className="text-sm text-gray-600">计划吃几顿：</span>
+                    <div className="flex gap-1">
+                      {[...Array(8)].map((_, i) => (
+                        <button
+                          key={i + 1}
+                          onClick={() => updateItemCredits(idx, i + 1)}
+                          className={cn(
+                            'w-8 h-8 rounded-lg text-sm font-medium transition',
+                            item.credits === i + 1
+                              ? 'bg-green-500 text-white'
+                              : 'bg-gray-200 hover:bg-gray-300'
+                          )}
+                        >
+                          {i + 1}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            <div className="flex gap-3">
+              <button
+                onClick={() => setStep('input')}
+                className="flex-1 py-3 bg-gray-200 text-gray-700 rounded-xl font-medium hover:bg-gray-300 transition"
+              >
+                返回修改
+              </button>
+              <button
+                onClick={handleSave}
+                className="flex-1 py-3 bg-green-500 text-white rounded-xl font-medium hover:bg-green-600 transition"
+              >
+                确认入库
+              </button>
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ============ 做饭视图 ============
+function CookView({ 
+  ingredients, 
+  onSaveIngredients,
+  onSaveMealPlan 
+}: { 
+  ingredients: Ingredient[];
+  onSaveIngredients: (ingredients: Ingredient[]) => void;
+  onSaveMealPlan: (plan: MealPlan) => void;
+}) {
+  const [targetCount, setTargetCount] = useState<4 | 5>(4);
+  const [mealPlan, setMealPlan] = useState<MealIngredient[]>([]);
+  const [actualAmounts, setActualAmounts] = useState<Record<string, number>>({});
+  const [step, setStep] = useState<'select' | 'plan' | 'complete'>('select');
+  const stockWarnings = getStockWarnings(ingredients);
+
+  const handleGenerate = () => {
+    const plan = generateMealPlan(ingredients, targetCount);
+    setMealPlan(plan);
+    const amounts: Record<string, number> = {};
+    plan.forEach(p => { amounts[p.ingredientId] = p.suggestedAmount; });
+    setActualAmounts(amounts);
+    setStep('plan');
+  };
+
+  const handleComplete = () => {
+    // 扣减库存
+    const updatedIngredients = ingredients.map(ing => {
+      const amount = actualAmounts[ing.id];
+      if (amount !== undefined) {
+        return {
+          ...ing,
+          quantity: Math.max(0, ing.quantity - amount),
+          remainingCredits: Math.max(0, ing.remainingCredits - 1),
+          status: ing.quantity - amount < ing.quantity * 0.3 ? 'opened' as const : ing.status,
+          updatedAt: Date.now(),
+        };
+      }
+      return ing;
+    }).filter(ing => ing.quantity > 0);
+
+    onSaveIngredients(updatedIngredients);
+
+    // 保存用餐记录
+    const plan: MealPlan = {
+      id: crypto.randomUUID(),
+      ingredients: mealPlan.map(p => ({ ...p, actualAmount: actualAmounts[p.ingredientId] })),
+      targetItemCount: targetCount,
+      createdAt: Date.now(),
+      completedAt: Date.now(),
+      status: 'completed',
+    };
+    onSaveMealPlan(plan);
+    
+    setStep('complete');
+  };
+
+  if (ingredients.length === 0) {
+    return (
+      <div className="bg-white rounded-2xl shadow-md p-12 text-center">
+        <div className="text-6xl mb-4">🥺</div>
+        <h3 className="text-xl font-semibold text-gray-700 mb-2">没有食材</h3>
+        <p className="text-gray-500">请先去入库添加食材</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-6">
+      {/* 库存警告提醒 */}
+      {stockWarnings.length > 0 && step === 'select' && (
+        <div className="bg-amber-50 rounded-2xl shadow-md p-4 border border-amber-200">
+          <h3 className="font-semibold text-amber-700 mb-2">📢 今日必用</h3>
+          <div className="space-y-1">
+            {stockWarnings.slice(0, 3).map((w, i) => (
+              <p key={i} className="text-sm text-amber-600">{w.message}</p>
+            ))}
+          </div>
+        </div>
+      )}
+
+      <div className="bg-white rounded-2xl shadow-md p-6">
+        <h2 className="text-lg font-semibold text-gray-800 mb-4">🍳 开始做饭</h2>
+        
+        {step === 'select' && (
+          <>
+            <p className="text-gray-600 mb-4">今天想吃几样？</p>
+            <div className="flex gap-4 mb-6">
+              <button
+                onClick={() => setTargetCount(4)}
+                className={cn(
+                  'flex-1 py-6 rounded-2xl text-xl font-bold transition',
+                  targetCount === 4
+                    ? 'bg-green-500 text-white shadow-lg'
+                    : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
+                )}
+              >
+                4 品类
+                <div className="text-sm font-normal mt-1">日常够吃</div>
+              </button>
+              <button
+                onClick={() => setTargetCount(5)}
+                className={cn(
+                  'flex-1 py-6 rounded-2xl text-xl font-bold transition',
+                  targetCount === 5
+                    ? 'bg-green-500 text-white shadow-lg'
+                    : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
+                )}
+              >
+                5 品类
+                <div className="text-sm font-normal mt-1">今天丰盛</div>
+              </button>
+            </div>
+            
+            <button
+              onClick={handleGenerate}
+              className="w-full py-4 bg-gradient-to-r from-green-500 to-blue-500 text-white rounded-xl font-bold text-lg hover:opacity-90 transition"
             >
               🎲 生成今日配给
             </button>
           </>
-        ) : (
-          <>
-            {/* 配给结果 */}
-            <div className="bg-gradient-to-br from-orange-50 to-yellow-50 rounded-2xl p-4 border-2 border-orange-200">
-              <div className="flex items-center justify-between mb-4">
-                <h3 className="font-bold text-orange-800">【今日配给】</h3>
-                <span className="text-orange-600 text-sm">
-                  剩余最大顿数: {Math.max(...ingredients.map(i => i.remainingCredits))}
-                </span>
-              </div>
-              
-              <div className="space-y-3">
-                {rationResults.map(result => (
-                  <div key={result.ingredient.id} className="bg-white rounded-xl p-4 shadow-sm">
-                    <div className="flex items-center justify-between mb-2">
-                      <div className="flex items-center gap-2">
-                        <span className={`px-2 py-0.5 rounded text-xs ${priorityLabels[result.priority].color}`}>
-                          {priorityLabels[result.priority].text}
-                        </span>
-                        <span className={`px-2 py-0.5 rounded text-xs ${categoryColors[result.ingredient.category]}`}>
-                          {categoryLabels[result.ingredient.category].split(' ')[0]}
-                        </span>
-                        <span className="font-bold text-gray-800">{result.ingredient.name}</span>
-                      </div>
-                      {showModify ? (
-                        <div className="flex items-center gap-2">
-                          <input
-                            type="number"
-                            value={actualAmounts[result.ingredient.id]}
-                            onChange={(e) => setActualAmounts({
-                              ...actualAmounts,
-                              [result.ingredient.id]: parseInt(e.target.value) || 0
-                            })}
-                            className="w-20 px-2 py-1 border rounded text-center"
-                          />
-                          <span className="text-gray-500">
-                            {result.ingredient.unit === 'g' ? 'g' : '个'}
-                          </span>
-                        </div>
-                      ) : (
-                        <span className="text-2xl font-bold text-orange-600">
-                          {result.suggestedAmount}
-                          <span className="text-sm text-gray-500 font-normal">
-                            {result.ingredient.unit === 'g' ? 'g' : '个'}
-                          </span>
-                        </span>
-                      )}
-                    </div>
-                    <p className="text-sm text-gray-500">💡 {result.reason}</p>
-                    <div className="text-xs text-gray-400 mt-1">
-                      库存: {result.ingredient.quantity}{result.ingredient.unit === 'g' ? 'g' : '个'} · 剩余 {result.ingredient.remainingCredits} 顿
-                    </div>
-                  </div>
-                ))}
-              </div>
-            </div>
-
-            {/* 操作按钮 */}
-            <div className="space-y-3">
-              {!showModify ? (
-                <>
-                  <button
-                    onClick={() => handleConfirmCook(false)}
-                    className="w-full bg-gradient-to-r from-emerald-500 to-green-600 text-white py-4 rounded-2xl font-bold text-lg hover:opacity-90 transition shadow-lg"
-                  >
-                    🍳 开始做饭
-                  </button>
-                  <button
-                    onClick={() => setShowModify(true)}
-                    className="w-full bg-orange-500 text-white py-3 rounded-xl font-medium hover:bg-orange-600 transition"
-                  >
-                    ✏️ 我要调整用量
-                  </button>
-                  <button
-                    onClick={() => setShowRation(false)}
-                    className="w-full bg-gray-200 text-gray-600 py-3 rounded-xl font-medium hover:bg-gray-300 transition"
-                  >
-                    ← 返回重选
-                  </button>
-                </>
-              ) : (
-                <>
-                  <button
-                    onClick={() => handleConfirmCook(true)}
-                    className="w-full bg-gradient-to-r from-orange-500 to-red-500 text-white py-4 rounded-2xl font-bold text-lg hover:opacity-90 transition shadow-lg"
-                  >
-                    ✅ 确认实际用量
-                  </button>
-                  <button
-                    onClick={() => setShowModify(false)}
-                    className="w-full bg-gray-200 text-gray-600 py-3 rounded-xl font-medium hover:bg-gray-300 transition"
-                  >
-                    取消
-                  </button>
-                </>
-              )}
-            </div>
-          </>
         )}
-      </div>
-    );
-  };
 
-  // 买菜视图
-  const ShopView = () => {
-    const [plannedCredits, setPlannedCredits] = useState(6);
-    const [shoppingInput, setShoppingInput] = useState('');
-    const [shoppingList, setShoppingList] = useState<{ name: string; suggestedAmount: number; unit: string; note: string; credits: number }[]>([]);
-    const [showList, setShowList] = useState(false);
-
-    // 当前库存中需要处理的食材
-    const warningItems = ingredients.filter(i => i.remainingCredits <= 2);
-
-    // 生成购物清单
-    const handleGenerateList = () => {
-      const items = shoppingInput.split(/[,，、\n;；]+/).map(s => s.trim()).filter(Boolean);
-      const plannedItems = items.map(name => ({
-        name,
-        credits: plannedCredits
-      }));
-      
-      const suggestions = calculateShoppingList(plannedItems, plannedCredits);
-      setShoppingList(suggestions.map(s => ({ ...s, credits: plannedCredits })));
-      setShowList(true);
-    };
-
-    // 调整单项顿数
-    const updateItemCredits = (index: number, credits: number) => {
-      const updated = [...shoppingList];
-      // 重新计算建议量
-      const item = updated[index];
-      const perMealAmount = item.suggestedAmount / item.credits;
-      updated[index] = {
-        ...item,
-        credits,
-        suggestedAmount: Math.round(perMealAmount * credits)
-      };
-      setShoppingList(updated);
-    };
-
-    return (
-      <div className="p-4 space-y-6">
-        <h2 className="text-2xl font-bold text-gray-800">🛒 我要买菜</h2>
-
-        {/* 库存警告 */}
-        {warningItems.length > 0 && (
-          <div className="bg-red-50 border border-red-200 rounded-2xl p-4">
-            <h3 className="font-bold text-red-700 mb-2">⚠️ 冰箱里还有存货</h3>
-            <div className="space-y-1">
-              {warningItems.map(item => (
-                <div key={item.id} className="text-sm text-red-600">
-                  • {item.name}: 还剩 {item.quantity}{item.unit === 'g' ? 'g' : '个'}，请先吃掉！
+        {step === 'plan' && (
+          <>
+            <div className="mb-6 space-y-4">
+              {mealPlan.map((item) => (
+                <div key={item.ingredientId} className="p-4 bg-gradient-to-r from-green-50 to-blue-50 rounded-xl">
+                  <div className="flex items-center justify-between mb-2">
+                    <span className="font-bold text-lg">{item.name}</span>
+                    <span className="text-sm text-gray-500">{item.reason}</span>
+                  </div>
+                  <div className="flex items-center gap-4">
+                    <span className="text-gray-600">建议用量:</span>
+                    <input
+                      type="number"
+                      value={actualAmounts[item.ingredientId] || 0}
+                      onChange={(e) => setActualAmounts({
+                        ...actualAmounts,
+                        [item.ingredientId]: parseInt(e.target.value) || 0
+                      })}
+                      className="w-24 px-3 py-2 border rounded-lg text-center font-bold"
+                    />
+                    <span className="text-gray-600">{item.unit === 'count' ? '个' : 'g'}</span>
+                  </div>
                 </div>
               ))}
             </div>
-          </div>
-        )}
 
-        {!showList ? (
-          <>
-            {/* 计划顿数 */}
-            <div className="bg-blue-50 rounded-2xl p-4">
-              <label className="block text-sm font-medium text-blue-700 mb-2">
-                这次计划吃几顿？
-              </label>
-              <div className="flex items-center gap-2">
-                {[4, 5, 6, 7, 8].map(n => (
-                  <button
-                    key={n}
-                    onClick={() => setPlannedCredits(n)}
-                    className={`w-12 h-12 rounded-xl font-bold text-lg transition ${
-                      plannedCredits === n
-                        ? 'bg-blue-500 text-white shadow-lg scale-110'
-                        : 'bg-white text-gray-600 hover:bg-blue-100'
-                    }`}
-                  >
-                    {n}
-                  </button>
-                ))}
-                <span className="text-blue-600 font-medium ml-2">顿</span>
-              </div>
-            </div>
-
-            {/* 想买的食材 */}
-            <div className="bg-white rounded-2xl shadow-md p-4">
-              <label className="block text-sm font-medium text-gray-700 mb-2">
-                想买哪些食材？（用逗号分隔）
-              </label>
-              <textarea
-                value={shoppingInput}
-                onChange={(e) => setShoppingInput(e.target.value)}
-                placeholder="菠菜、西葫芦、金针菇、鸡胸肉、荞麦面"
-                className="w-full h-24 p-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-blue-500 focus:border-transparent resize-none"
-              />
+            <div className="flex gap-3">
               <button
-                onClick={handleGenerateList}
-                disabled={!shoppingInput.trim()}
-                className="w-full mt-3 bg-blue-500 text-white py-3 rounded-xl font-medium hover:bg-blue-600 transition disabled:opacity-50"
+                onClick={() => setStep('select')}
+                className="flex-1 py-3 bg-gray-200 text-gray-700 rounded-xl font-medium"
               >
-                📝 生成购买建议
+                重新选择
+              </button>
+              <button
+                onClick={handleComplete}
+                className="flex-1 py-3 bg-green-500 text-white rounded-xl font-medium"
+              >
+                ✅ 完成本顿
               </button>
             </div>
           </>
-        ) : (
-          <>
-            {/* 购物清单 */}
-            <div className="bg-gradient-to-br from-blue-50 to-cyan-50 rounded-2xl p-4 border-2 border-blue-200">
-              <h3 className="font-bold text-blue-800 mb-4">
-                🛒 购买清单（{plannedCredits} 顿计划）
-              </h3>
-              <div className="space-y-3">
-                {shoppingList.map((item, idx) => (
-                  <div key={idx} className="bg-white rounded-xl p-4 shadow-sm">
-                    <div className="flex items-center justify-between mb-2">
-                      <span className="font-bold text-gray-800">{item.name}</span>
-                      <span className="text-2xl font-bold text-blue-600">
-                        {item.suggestedAmount}
-                        <span className="text-sm text-gray-500 font-normal">{item.unit}</span>
-                      </span>
-                    </div>
-                    {item.note && (
-                      <p className="text-sm text-gray-500 mb-2">💡 {item.note}</p>
-                    )}
-                    <div className="flex items-center justify-between">
-                      <span className="text-xs text-gray-400">调整顿数:</span>
-                      <div className="flex items-center gap-2">
-                        <button
-                          onClick={() => updateItemCredits(idx, Math.max(1, item.credits - 1))}
-                          className="w-8 h-8 rounded-lg bg-gray-200 hover:bg-gray-300 font-bold"
-                        >
-                          -
-                        </button>
-                        <span className="w-8 text-center font-bold text-blue-600">{item.credits}</span>
-                        <button
-                          onClick={() => updateItemCredits(idx, item.credits + 1)}
-                          className="w-8 h-8 rounded-lg bg-gray-200 hover:bg-gray-300 font-bold"
-                        >
-                          +
-                        </button>
-                        <span className="text-gray-500 text-sm">顿</span>
-                      </div>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            </div>
+        )}
 
+        {step === 'complete' && (
+          <div className="text-center py-8">
+            <div className="text-6xl mb-4">🎉</div>
+            <h3 className="text-xl font-bold text-green-600 mb-2">本顿已完成！</h3>
+            <p className="text-gray-500 mb-6">库存已自动更新</p>
             <button
-              onClick={() => setShowList(false)}
-              className="w-full bg-gray-200 text-gray-600 py-3 rounded-xl font-medium hover:bg-gray-300 transition"
+              onClick={() => setStep('select')}
+              className="px-6 py-3 bg-green-500 text-white rounded-xl font-medium"
             >
-              ← 返回修改
+              返回
             </button>
-          </>
+          </div>
         )}
       </div>
-    );
-  };
+    </div>
+  );
+}
 
-  // 渲染当前视图
-  const renderView = () => {
-    switch (currentView) {
-      case 'home':
-        return <HomeView />;
-      case 'stock':
-        return <StockView />;
-      case 'cook':
-        return <CookView />;
-      case 'shop':
-        return <ShopView />;
-      default:
-        return <HomeView />;
-    }
+// ============ 买菜视图 ============
+function ShopView({ ingredients }: { ingredients: Ingredient[] }) {
+  const [input, setInput] = useState('');
+  const [plannedCredits, setPlannedCredits] = useState(6);
+  const [shoppingList, setShoppingList] = useState<ShoppingItem[]>([]);
+  const [showInventoryCheck, setShowInventoryCheck] = useState(true);
+  
+  const stockWarnings = getStockWarnings(ingredients);
+  const doNotBuyList = getDoNotBuyList(ingredients);
+  const maxCredits = getMaxRemainingCredits(ingredients);
+
+  const handleGenerateList = () => {
+    const wantedItems = input.split(/[，,、\n]+/).map(s => s.trim()).filter(Boolean);
+    const normalizedItems = wantedItems.map(normalizeIngredientName);
+    const list = generateShoppingList(normalizedItems, plannedCredits, ingredients);
+    setShoppingList(list);
+    setShowInventoryCheck(false);
   };
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-gray-50 to-gray-100 pb-24">
-      <div className="max-w-lg mx-auto">
-        {renderView()}
+    <div className="space-y-6">
+      {/* 库存盘点提示 */}
+      {showInventoryCheck && ingredients.length > 0 && (
+        <div className="bg-blue-50 rounded-2xl shadow-md p-6 border border-blue-200">
+          <h2 className="text-lg font-semibold text-blue-700 mb-3">📦 库存盘点</h2>
+          <p className="text-blue-600 mb-3">
+            冰箱还剩 <strong>{ingredients.length}</strong> 种食材，约 <strong>{maxCredits}</strong> 顿的量
+          </p>
+          
+          {stockWarnings.length > 0 && (
+            <div className="space-y-2 mb-3">
+              {stockWarnings.map((w, i) => (
+                <div key={i} className={cn(
+                  "p-2 rounded-lg text-sm",
+                  w.type === 'opened' ? 'bg-red-100 text-red-700' :
+                  w.type === 'old' ? 'bg-orange-100 text-orange-700' :
+                  'bg-yellow-100 text-yellow-700'
+                )}>
+                  {w.message}
+                </div>
+              ))}
+            </div>
+          )}
+          
+          {doNotBuyList.length > 0 && (
+            <div className="bg-red-50 p-3 rounded-lg border border-red-200">
+              <p className="font-semibold text-red-700 mb-2">🚫 不要买这些：</p>
+              {doNotBuyList.map((item, i) => (
+                <p key={i} className="text-sm text-red-600">
+                  <strong>{item.name}</strong> - {item.reason}
+                </p>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      <div className="bg-white rounded-2xl shadow-md p-6">
+        <h2 className="text-lg font-semibold text-gray-800 mb-4">🛒 我要买菜</h2>
+        
+        {/* 追加顿数 */}
+        <div className="mb-4">
+          <label className="block text-sm font-medium text-gray-700 mb-2">
+            {ingredients.length > 0 ? '追加吃几顿？' : '这次买菜吃几顿？'}
+          </label>
+          <div className="flex gap-2 flex-wrap">
+            {[3, 4, 5, 6, 7, 8].map(n => (
+              <button
+                key={n}
+                onClick={() => setPlannedCredits(n)}
+                className={cn(
+                  'px-4 py-2 rounded-lg font-medium transition',
+                  plannedCredits === n
+                    ? 'bg-green-500 text-white'
+                    : 'bg-gray-100 text-gray-700'
+                )}
+              >
+                {n}顿
+              </button>
+            ))}
+          </div>
+          {ingredients.length > 0 && (
+            <p className="text-sm text-gray-500 mt-2">
+              现有 {maxCredits} 顿 + 追加 {plannedCredits} 顿 = 总共 <strong>{maxCredits + plannedCredits}</strong> 顿
+            </p>
+          )}
+        </div>
+
+        {/* 输入想买的食材 */}
+        <div className="mb-4">
+          <label className="block text-sm font-medium text-gray-700 mb-2">
+            想买什么？（支持别名，如"番茄"）
+          </label>
+          <textarea
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            placeholder="例如：鸡胸肉、番茄、黄瓜、金针菇"
+            className="w-full h-24 p-3 border rounded-xl"
+          />
+        </div>
+
+        <button
+          onClick={handleGenerateList}
+          disabled={!input.trim()}
+          className="w-full py-3 bg-green-500 text-white rounded-xl font-medium disabled:bg-gray-300"
+        >
+          生成购买清单
+        </button>
+
+        {/* 购物清单结果 */}
+        {shoppingList.length > 0 && (
+          <div className="mt-6 space-y-4">
+            <h3 className="font-semibold text-gray-800">📋 购买建议</h3>
+            {shoppingList.map((item, idx) => (
+              <div key={idx} className="p-4 bg-gray-50 rounded-xl">
+                <div className="flex items-center justify-between mb-2">
+                  <div className="flex items-center gap-2">
+                    <span className={cn('px-2 py-1 rounded-full text-xs', categoryColors[item.category])}>
+                      {categoryNames[item.category]}
+                    </span>
+                    <span className="font-semibold">{item.name}</span>
+                  </div>
+                  <span className="font-bold text-green-600">
+                    {item.suggestedAmount > 0 
+                      ? `买 ${item.suggestedAmount}${item.unit === 'count' ? '个' : 'g'}`
+                      : '不用买'
+                    }
+                  </span>
+                </div>
+                {item.warning && (
+                  <p className="text-sm text-amber-600">{item.warning}</p>
+                )}
+                {item.existingStock !== undefined && item.existingStock > 0 && !item.warning && (
+                  <p className="text-sm text-gray-500">
+                    库存还有 {item.existingStock}{item.unit === 'count' ? '个' : 'g'}
+                  </p>
+                )}
+              </div>
+            ))}
+
+            {/* 不要买的提醒 */}
+            {doNotBuyList.length > 0 && (
+              <div className="p-4 bg-red-50 rounded-xl border border-red-200">
+                <p className="font-semibold text-red-700 mb-2">🚫 别买！别买！别买！</p>
+                {doNotBuyList.map((item, i) => (
+                  <p key={i} className="text-sm text-red-600">
+                    <strong>{item.name}</strong>：{item.reason}
+                  </p>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
       </div>
-      <NavBar />
     </div>
   );
 }
